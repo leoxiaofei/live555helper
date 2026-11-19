@@ -12,13 +12,20 @@
 
 #include "rtspconnectionclient.h"
 #include <algorithm>
+#include <cstring>
 #include <iostream>
+#include <memory>
 #include <sstream>
 
+// declared below, used by the RTSPConnection constructor
+static time_t parseClockTime(const std::string& clockTime);
 
-RTSPConnection::RTSPConnection(Environment& env, Callback* callback, const char* rtspURL, const std::map<std::string,std::string> & opts, int verbosityLevel) 
+
+RTSPConnection::RTSPConnection(Environment& env, Callback* callback, const char* rtspURL, const std::map<std::string,std::string> & opts, int verbosityLevel)
 				: m_startCallbackTask(NULL)
 				, m_stopCallbackTask(NULL)
+				, m_PlayTask(NULL)
+				, m_PauseTask(NULL)
 				, m_env(env)
 				, m_callback(callback)
 				, m_url(rtspURL)
@@ -59,6 +66,93 @@ RTSPConnection::~RTSPConnection()
 {
 	m_env.taskScheduler().unscheduleDelayedTask(m_startCallbackTask);
 	m_env.taskScheduler().unscheduleDelayedTask(m_stopCallbackTask);
+	m_env.taskScheduler().unscheduleDelayedTask(m_PlayTask);
+	m_env.taskScheduler().unscheduleDelayedTask(m_PauseTask);
+}
+
+void RTSPConnection::scale(float scale)
+{
+	if(m_rtspClient)
+	{
+		m_rtspClient->setScale(scale);
+
+		m_env.taskScheduler().unscheduleDelayedTask(m_PlayTask);
+		m_PlayTask = m_env.taskScheduler().scheduleDelayedTask(0, TaskPlay, this);
+	}
+}
+
+void RTSPConnection::seek(double nptStartTime)
+{
+	if(m_rtspClient)
+	{
+		m_rtspClient->setStartTime(std::string(), nptStartTime);
+	
+		m_env.taskScheduler().unscheduleDelayedTask(m_PlayTask);
+		m_PlayTask = m_env.taskScheduler().scheduleDelayedTask(0, TaskPlay, this);
+	}
+}
+
+void RTSPConnection::seek(const std::string& clockStartTime)
+{
+	if(m_rtspClient)
+	{
+		m_rtspClient->setStartTime(clockStartTime);
+
+		m_env.taskScheduler().unscheduleDelayedTask(m_PlayTask);
+		m_PlayTask = m_env.taskScheduler().scheduleDelayedTask(0, TaskPlay, this);
+	}
+}
+
+void RTSPConnection::TaskPlay()
+{
+	if (m_rtspClient != NULL)
+	{
+		m_rtspClient->sendPlay();
+	}
+	else
+	{
+		m_env << "RTSPConnection cannot send PLAY command: client is not connected\n";
+	}
+}
+
+void RTSPConnection::pause()
+{
+	if (m_rtspClient)
+	{
+		m_env.taskScheduler().unscheduleDelayedTask(m_PauseTask);
+		m_PauseTask = m_env.taskScheduler().scheduleDelayedTask(0, TaskPause, this);
+	}
+}
+
+void RTSPConnection::resume()
+{
+	if (m_rtspClient)
+	{
+		m_env.taskScheduler().unscheduleDelayedTask(m_PlayTask);
+		m_PlayTask = m_env.taskScheduler().scheduleDelayedTask(0, TaskPlay, this);
+	}
+}
+
+void RTSPConnection::TaskPause()
+{
+	if (m_rtspClient != NULL)
+	{
+		m_rtspClient->sendPause();
+	}
+	else
+	{
+		m_env << "RTSPConnection cannot send PAUSE command: client is not connected\n";
+	}
+}
+
+double RTSPConnection::getNormalPlayTime(const char* id, struct timeval presentationTime)
+{
+	// the NPT is identical for all the tracks of the presentation, the track id is not used to compute it
+	if (m_rtspClient != NULL)
+	{
+		return m_rtspClient->getNormalPlayTime(presentationTime);
+	}
+	return -1.0;
 }
 
 int getHttpTunnelPort(int  rtptransport, const char* rtspURL) 
@@ -99,8 +193,11 @@ RTSPConnection::RTSPClientConnection::RTSPClientConnection(RTSPConnection& conne
 				, m_nptStartTime(0)
 				, m_clockStartTime("")
 				, m_subSession(NULL)
+				, m_nptSubsession(NULL)
 				, m_KeepAliveTask(NULL)
+				, m_scale(1.0f)
 				, m_getparameterSupported(false)
+				, m_clockMode(false)
 {
 	// start tasks
 	m_ConnectionTimeoutTask = envir().taskScheduler().scheduleDelayedTask(m_timeout*1000000, TaskConnectionTimeout, this);
@@ -140,8 +237,9 @@ RTSPConnection::RTSPClientConnection::~RTSPClientConnection()
 	}
 }
 
+
 std::string getParamValue(const std::string& url, const std::string& param) {
-    std::string value;
+	std::string value;
     size_t pos = url.find(param + "=");
     if (pos != std::string::npos) {
         value = url.substr(pos + param.size() + 1);
@@ -158,9 +256,11 @@ std::string getParamValue(const std::string& url, const std::string& param) {
 void RTSPConnection::RTSPClientConnection::setNptstartTime()
 {
 	m_nptStartTime = 0;
-	m_clockStartTime = "";
+	m_clockEndTime = "";
+	m_scale = 1.0f;
+
 	std::string urlStr = m_connection.getUrl();
-	
+
 	std::string nptTimeValue = getParamValue(urlStr, "ntptime");
 	if (!nptTimeValue.empty()) {
 		m_nptStartTime = std::stod(nptTimeValue);
@@ -171,11 +271,24 @@ void RTSPConnection::RTSPClientConnection::setNptstartTime()
 		size_t pos = startTimeValue.find('&');
 		if (pos != std::string::npos) {
 			startTimeValue = startTimeValue.substr(0, pos);
-		}		
+		}
 		m_clockStartTime = startTimeValue;
 	}
-}
 
+	std::string endTimeValue = getParamValue(urlStr, "endtime");
+	if (!endTimeValue.empty()) {
+		size_t pos = endTimeValue.find('&');
+		if (pos != std::string::npos) {
+			endTimeValue = endTimeValue.substr(0, pos);
+		}
+		m_clockEndTime = endTimeValue;
+	}
+
+	std::string scaleValue = getParamValue(urlStr, "scale");
+	if (!scaleValue.empty()) {
+		m_scale = std::stof(scaleValue);
+	}
+}
 
 void RTSPConnection::RTSPClientConnection::continueAfterOPTIONS(int resultCode, char* resultString)
 {
@@ -207,7 +320,155 @@ void RTSPConnection::RTSPClientConnection::continueAfterOPTIONS(int resultCode, 
     delete[] resultString;
 }
 
-void RTSPConnection::RTSPClientConnection::sendNextCommand() 
+void RTSPConnection::RTSPClientConnection::setStartTime(const std::string& clockStartTime, double nptStartTime)
+{
+	m_clockStartTime = clockStartTime;
+	m_nptStartTime = nptStartTime;
+}
+
+void RTSPConnection::RTSPClientConnection::setScale(float scale)
+{
+	m_scale = scale;
+}
+
+double RTSPConnection::RTSPClientConnection::getNormalPlayTime(struct timeval const& presentationTime)
+{
+	// the NPT is computed by live555 from the "RTP-Info:" header of the PLAY answer and
+	// the RTCP synchronized presentation time, it is identical for all the tracks:
+	// only the subsession selected when the PLAY answer was parsed is used
+	if ( (m_nptSubsession != NULL)
+	  && (m_nptSubsession->rtpInfo.infoIsNew || m_nptSubsession->rtpSource()->hasBeenSynchronizedUsingRTCP()) )
+	{
+		return m_nptSubsession->getNormalPlayTime(presentationTime);
+	}
+	return -1.0;
+}
+
+void RTSPConnection::RTSPClientConnection::sendPlay()
+{
+	if(m_session) {
+		if (m_clockStartTime != "") {
+			envir() << "send PLAY Range: clock=" << m_clockStartTime.c_str() << "-" << m_clockEndTime.c_str() << " scale:" << m_scale << "\n";
+			this->sendPlayCommand(*m_session, continueAfterPLAY, m_clockStartTime.c_str(), m_clockEndTime.c_str(), m_scale);
+			m_clockStartTime.clear();
+		}
+		else if (m_nptStartTime > 0) {
+			envir() << "send PLAY Range: npt=" << m_nptStartTime << "- scale:" << m_scale << "\n";
+			this->sendPlayCommand(*m_session, continueAfterPLAY, m_nptStartTime, -1.0, m_scale);
+			m_nptStartTime = 0;
+		}
+		else {
+			envir() << "send PLAY Range: (resume) scale:" << m_scale << "\n";
+			this->sendPlayCommand(*m_session, continueAfterPLAY, -1.0, -1.0, m_scale);
+		}
+	}
+}
+
+std::vector<float> RTSPConnection::RTSPClientConnection::getSupportedScales() const
+{
+	// parse the "Scales=" list of the last "Media-Properties:" answer,
+	// e.g. Scales="-1, 0.5, 0.25, 0.125,:1, 2, 4"
+	std::vector<float> scales;
+	const char* mediaProperties = this->mediaProperties();
+	if (mediaProperties == NULL)
+	{
+		return scales;
+	}
+	const char* pos = strstr(mediaProperties, "Scales=");
+	if (pos == NULL)
+	{
+		return scales;
+	}
+	pos += strlen("Scales=");
+	if (*pos == '"')
+	{
+		// quoted list: Scales="-1, 0.5, 2, 4"
+		++pos;
+	}
+	while ( (*pos != '\0') && (*pos != '"') && (scales.size() < 16) )
+	{
+		char* end = NULL;
+		float scale = strtof(pos, &end);
+		if (end != pos)
+		{
+			scales.push_back(scale);
+			pos = end;
+		}
+		else
+		{
+			// skip an unparsable character (e.g. ':' in "0.125,:1")
+			++pos;
+		}
+		while ( (*pos == ',') || (*pos == ' ') )
+		{
+			++pos;
+		}
+	}
+	return scales;
+}
+
+std::vector<float> RTSPConnection::getSupportedScales() const
+{
+	if (m_rtspClient != NULL)
+	{
+		return m_rtspClient->getSupportedScales();
+	}
+	return std::vector<float>();
+}
+
+double RTSPConnection::RTSPClientConnection::getPlayDuration() const
+{
+	// duration of the play range: from the npt range of the SDP/PLAY answer,
+	// or computed from the absolute end time when the npt end time is unknown
+	// (an open ended "Range:" in the PLAY answer resets the npt end time)
+	if (m_session == NULL)
+	{
+		return 0.0;
+	}
+	if (m_session->playEndTime() > m_session->playStartTime())
+	{
+		return m_session->playEndTime() - m_session->playStartTime();
+	}
+	if (m_session->absEndTime() != NULL)
+	{
+		// absolute end time of the range, the start is the npt start time
+		// when the absolute start time is not known (it is the beginning of the range)
+		struct tm tmEnd;
+		memset(&tmEnd, 0, sizeof(tmEnd));
+		if (sscanf(m_session->absEndTime(), "%04d%02d%02dT%02d%02d%02dZ", &tmEnd.tm_year, &tmEnd.tm_mon, &tmEnd.tm_mday, &tmEnd.tm_hour, &tmEnd.tm_min, &tmEnd.tm_sec) == 6)
+		{
+			tmEnd.tm_year -= 1900;
+			tmEnd.tm_mon -= 1;
+			time_t endTime = timegm(&tmEnd);
+
+			time_t startTime = 0;
+			const char* absStartTime = m_session->absStartTime();
+			if (absStartTime != NULL)
+			{
+				struct tm tmStart;
+				memset(&tmStart, 0, sizeof(tmStart));
+				if (sscanf(absStartTime, "%04d%02d%02dT%02d%02d%02dZ", &tmStart.tm_year, &tmStart.tm_mon, &tmStart.tm_mday, &tmStart.tm_hour, &tmStart.tm_min, &tmStart.tm_sec) == 6)
+				{
+					tmStart.tm_year -= 1900;
+					tmStart.tm_mon -= 1;
+					startTime = timegm(&tmStart);
+				}
+			}
+			return difftime(endTime, startTime);
+		}
+	}
+	return 0.0;
+}
+
+void RTSPConnection::RTSPClientConnection::sendPause()
+{
+	if (m_session)
+	{
+		this->sendPauseCommand(*m_session, continueAfterPAUSE);
+	}
+}
+
+void RTSPConnection::RTSPClientConnection::sendNextCommand()
 {
 	if (m_subSessionIter == NULL)
 	{
@@ -243,16 +504,10 @@ void RTSPConnection::RTSPClientConnection::sendNextCommand()
 				envir() << "****************************************************************************************\n";
 				envir() << " nptTime is given read video from it :: m_nptStartTime " << m_nptStartTime << "\n";
 				envir() << " clockstarttime is given read video from it :: m_clockStartTime " << m_clockStartTime.c_str() << "\n";
+				envir() << " scale is given read video from it :: " << m_scale << "\n";
 			}
-			if (m_clockStartTime != "") {
-				this->sendPlayCommand(*m_session, continueAfterPLAY, m_clockStartTime.c_str());
-			}
-			else if (m_nptStartTime > 0) {
-				this->sendPlayCommand(*m_session, continueAfterPLAY, m_nptStartTime);
-			}
-			else {
-				this->sendPlayCommand(*m_session, continueAfterPLAY);
-			}
+
+			sendPlay();
 		}
 	}
 }
@@ -268,7 +523,7 @@ void RTSPConnection::RTSPClientConnection::continueAfterDESCRIBE(int resultCode,
 	}
 	else
 	{
-		if (fVerbosityLevel > 1) 
+		if (fVerbosityLevel > 1)
 		{
 			envir() << "Got SDP:\n" << resultString << "\n";
 		}
@@ -330,16 +585,83 @@ void RTSPConnection::RTSPClientConnection::continueAfterPLAY(int resultCode, cha
 	}
 	else
 	{
-		if (fVerbosityLevel > 1) 
+		if (fVerbosityLevel > 1)
 		{
 			envir() << "PLAY OK" << "\n";
 		}
+
+			// the server may negotiate a different "Scale:" value in the PLAY response,
+			// live555 already parsed it into MediaSession::scale() (left to 1.0 when the header is absent,
+			// so 1.0 also means "no Scale header": most servers apply the requested speed without echoing it)
+			float scale = m_session->scale();
+			if (scale != 0.0f && scale != 1.0f && scale != m_scale)
+			{
+				envir() << "Server scale is now:" << scale << " (was " << m_scale << ")\n";
+				m_scale = scale;
+			}
+
+		// select the subsession computing the normal play time: prefer the first track that
+		// received a "RTP-Info:" entry in the PLAY answer (live555 assigns the entries in
+		// subsession order, some servers send less entries than tracks), fallback to the
+		// first with a RTP source; the NPT is identical for all the tracks
+		m_nptSubsession = NULL;
+		{
+			MediaSubsessionIterator iter(*m_session);
+			MediaSubsession* subsession;
+			while ((subsession = iter.next()) != NULL)
+			{
+				if (subsession->rtpSource() == NULL)
+				{
+					continue;
+				}
+				if (m_nptSubsession == NULL)
+				{
+					// fallback: first subsession with a RTP source
+					m_nptSubsession = subsession;
+				}
+				if (subsession->rtpInfo.infoIsNew)
+				{
+					// subsession that received a "RTP-Info:" entry
+					m_nptSubsession = subsession;
+					break;
+				}
+			}
+		}
+
+		m_clockMode = m_session->absStartTime() != NULL;
+
+		// the session may be re-PLAYed (seek or scale change), unschedule tasks before scheduling new ones
+		envir().taskScheduler().unscheduleDelayedTask(m_DataArrivalTimeoutTask);
+		envir().taskScheduler().unscheduleDelayedTask(m_KeepAliveTask);
 		m_DataArrivalTimeoutTask = envir().taskScheduler().scheduleDelayedTask(m_timeout*1000000, TaskDataArrivalTimeout, this);
 		if (m_getparameterSupported) {
 			m_KeepAliveTask = envir().taskScheduler().scheduleDelayedTask(m_timeout * 1000000, TaskKeepAlive, this);
 		}
+
+		m_callback->onPlayUpdate(m_connection);
 	}
 	envir().taskScheduler().unscheduleDelayedTask(m_ConnectionTimeoutTask);
+	delete[] resultString;
+}
+
+void RTSPConnection::RTSPClientConnection::continueAfterPAUSE(int resultCode, char* resultString)
+{
+	if (resultCode != 0)
+	{
+		envir() << "Failed to PAUSE: " << resultString << "\n";
+		m_callback->onError(m_connection, resultString);
+	}
+	else
+	{
+		if (fVerbosityLevel > 1)
+		{
+			envir() << "PAUSE OK" << "\n";
+		}
+
+		// no data will arrive while paused, do not let the data arrival timeout fire,
+		// it is scheduled again by the next PLAY (resume, seek or scale change)
+		envir().taskScheduler().unscheduleDelayedTask(m_DataArrivalTimeoutTask);
+	}
 	delete[] resultString;
 }
 

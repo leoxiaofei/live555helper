@@ -10,11 +10,11 @@
 
 #include "SessionSink.h"
 
-SessionSink::SessionSink(UsageEnvironment& env, SessionCallback* callback, size_t bufferSize) 
+SessionSink::SessionSink(UsageEnvironment& env, SessionCallback* callback, size_t bufferSize)
 	: MediaSink(env)
 	, m_buffer(NULL)
 	, m_bufferSize(bufferSize)
-	, m_callback(callback) 
+	, m_callback(callback)
 	, m_markerSize(0)
 {
 }

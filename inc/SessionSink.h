@@ -26,7 +26,7 @@ class SessionCallback
 		virtual bool    onNewSession(const char* id, const char* media, const char* codec, const char* sdp, unsigned int rtpfrequency, unsigned int channels) { return true; }
 		virtual void    onCloseSession(const char* id) { }
 		virtual bool    onData(const char* id, unsigned char* buffer, ssize_t size, struct timeval presentationTime) = 0;
-		virtual ssize_t onNewBuffer(const char* id, const char* mime, unsigned char* buffer, ssize_t size)  { 
+		virtual ssize_t onNewBuffer(const char* id, const char* mime, unsigned char* buffer, ssize_t size)  {
 			ssize_t markerSize = 0;
 			if ( (strcmp(mime, "video/H264") == 0) || (strcmp(mime, "video/H265") == 0) ) {
 				if (size > sizeof(H26X_marker))
@@ -42,7 +42,7 @@ class SessionCallback
 /* ---------------------------------------------------------------------------
 **  Media client Sink
 ** -------------------------------------------------------------------------*/
-class SessionSink: public MediaSink 
+class SessionSink: public MediaSink
 {
 	public:
 		static SessionSink* createNew(UsageEnvironment& env, SessionCallback* callback, size_t bufferSize = 2*1024*1024) { return new SessionSink(env, callback, bufferSize); }
@@ -68,7 +68,7 @@ class SessionSink: public MediaSink
 	private:
 		u_int8_t*              m_buffer;
 		size_t                 m_bufferSize;
-		SessionCallback*       m_callback; 	
+		SessionCallback*       m_callback;
 		ssize_t                m_markerSize;
 };
 	
